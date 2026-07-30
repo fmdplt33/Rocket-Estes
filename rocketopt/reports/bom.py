@@ -143,12 +143,19 @@ def bill_of_materials(rocket: Rocket) -> list[BomItem]:
     mount = rocket.motor_mount
     items.append(
         BomItem(
-            name="Motor tube",
+            name="Motor mount",
             specification=(
                 f"{mount.material.display_name}, "
                 f"{mount.inner_diameter * 1e3:.1f} mm ID x "
-                f"{mount.wall_thickness * 1e3:.2f} mm wall, "
+                f"{mount.outer_diameter * 1e3:.1f} mm OD "
+                f"({mount.wall_thickness * 1e3:.2f} mm wall), "
                 f"{mount.length * 1e3:.0f} mm long"
+                + (
+                    "; a self-centring fit in the airframe bore, print or turn "
+                    "it as one piece"
+                    if mount.is_minimum_diameter
+                    else ""
+                )
             ),
             quantity=1,
             units="off",
@@ -303,17 +310,17 @@ Fins that differ from one another induce roll and cost altitude.
 **Fin section.** Shape to a {fins.airfoil.label.lower()} section.
 {_airfoil_instruction(rocket)}
 
-**Motor tube.** Cut to {mount.length * 1e3:.0f} mm.
+**Motor mount.** {mount.inner_diameter * 1e3:.1f} mm bore x
+{mount.outer_diameter * 1e3:.1f} mm outside diameter, cut to
+{mount.length * 1e3:.0f} mm.
 
 ## Assembly
 
-1. **Motor mount.** Fit the centring rings to the motor tube, one flush with
-   the aft end and one {mount.length * 0.7e3:.0f} mm forward. Add a thrust
-   ring or engine hook at the forward end so the motor cannot be driven into
-   the airframe under thrust.
+1. **Motor mount.** {_mount_instruction(rocket)}
 
-2. **Install the mount.** Slide the assembly into the body tube so the motor
-   tube ends flush with the aft end. Glue both rings.
+2. **Install the mount.** Slide it into the body tube so its aft face ends
+   flush with the aft end of the tube, and glue it. Check it has gone in
+   square: a mount glued in crooked points the thrust off the axis.
 
 3. **Mark the fin lines.** Wrap a strip of paper around the tube, mark the
    circumference, divide it into {fins.count} equal parts
@@ -347,6 +354,31 @@ Fins that differ from one another induce roll and cost altitude.
 - Confirm all fins are firmly attached. A fin that can be twisted by hand will
   come off in flight.
 """
+
+
+def _mount_instruction(rocket: Rocket) -> str:
+    """Return fitting instructions for the motor mount.
+
+    A mount turned to the airframe bore locates itself and needs no rings; a
+    narrower one has to be centred by them.
+    """
+    mount = rocket.motor_mount
+    thrust_ring = (
+        "Add a thrust ring or engine hook at the forward end so the motor "
+        "cannot be driven into the airframe under thrust."
+    )
+    if mount.is_minimum_diameter:
+        return (
+            f"The mount is {mount.outer_diameter * 1e3:.1f} mm outside diameter "
+            f"against a {mount.body_inner_radius * 2e3:.1f} mm airframe bore, so "
+            f"it centres itself along its whole length and needs no centring "
+            f"rings. Ease the outside diameter with fine paper until it slides "
+            f"in with firm hand pressure, no more. {thrust_ring}"
+        )
+    return (
+        f"Fit the centring rings to the motor tube, one flush with the aft end "
+        f"and one {mount.length * 0.7e3:.0f} mm forward. {thrust_ring}"
+    )
 
 
 def _airfoil_instruction(rocket: Rocket) -> str:

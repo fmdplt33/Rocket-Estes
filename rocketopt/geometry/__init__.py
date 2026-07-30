@@ -12,12 +12,18 @@ from rocketopt.geometry.components import (
     RecoveryType,
     Transition,
 )
+from rocketopt.geometry.fin_sections import (
+    section_area,
+    section_area_ratio,
+    section_outline,
+)
 from rocketopt.geometry.mass_properties import MassProperties, combine
 from rocketopt.geometry.nose_cones import (
     SHAPE_PARAMETER_RANGES,
     NoseCone,
     NoseConeShape,
     default_shape_parameter,
+    default_shoulder_length,
 )
 from rocketopt.geometry.rocket import PlacedSection, Rocket, build_rocket
 
@@ -39,4 +45,8 @@ __all__ = [
     "build_rocket",
     "combine",
     "default_shape_parameter",
+    "default_shoulder_length",
+    "section_area",
+    "section_area_ratio",
+    "section_outline",
 ]

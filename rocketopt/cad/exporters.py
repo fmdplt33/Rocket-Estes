@@ -2,12 +2,16 @@
 
 Two tiers of output, so that useful CAD is always produced:
 
-*Always available* - SVG fin templates, an SVG side elevation and a DXF fin
-outline are written with no third-party dependency. The fin template is the
-one output a builder genuinely needs: printed at 1:1 it is glued to the fin
-stock and cut around.
+*Always available* - printable STL solids of every part, SVG fin templates, an
+SVG side elevation and a DXF fin outline, none of which need a third-party
+dependency. The STLs come from :mod:`rocketopt.cad.parts` by way of the mesh
+kernel in :mod:`rocketopt.cad.mesh`, and are checked against
+:mod:`rocketopt.cad.validation` before anything is written, so an exported set
+assembles and slices. The fin template is the one 2D output a builder genuinely
+needs: printed at 1:1 it is glued to the fin stock and cut around.
 
-*With CadQuery installed* - STEP and STL solids of every component.
+*With CadQuery installed* - STEP solids of every component, built from the same
+profiles as the STLs so the two agree.
 
 The Fusion 360 script from :mod:`rocketopt.cad.fusion360` is always written
 too, and is the better route into parametric CAD than a STEP import.
@@ -15,10 +19,21 @@ too, and is the better route into parametric CAD than a STEP import.
 
 from __future__ import annotations
 
-import math
 from pathlib import Path
+from typing import Final
 
-from rocketopt.geometry.components import BodyTube, Transition
+from rocketopt.cad.mesh import dedupe_polyline, write_stl
+from rocketopt.cad.parts import (
+    DEFAULT_TOLERANCES,
+    PrintTolerances,
+    body_tube_profile,
+    fin_loft_sections,
+    motor_mount_profile,
+    nose_cone_profile,
+    printable_parts,
+)
+from rocketopt.cad.validation import validate_printable_assembly
+from rocketopt.geometry.components import Transition
 from rocketopt.geometry.rocket import Rocket
 from rocketopt.utils.logging import get_logger
 
@@ -29,8 +44,17 @@ __all__ = [
     "export_profile_svg",
     "export_fin_dxf",
     "export_solids",
+    "export_stl_parts",
     "export_all",
 ]
+
+_MIN_STEP_TIP_CHORD: Final[float] = 0.05e-3
+"""Shortest chord a lofted STEP section may have [m].
+
+A BREP loft cannot close on a point, so a delta fin's sharp tip becomes a
+0.05 mm sliver in STEP. The STL keeps the true point, and 0.05 mm is below what
+any cutter or printer resolves.
+"""
 
 _SVG_SCALE = 3.7795275591
 """Pixels per millimetre at 96 dpi, so an SVG prints at 1:1."""
@@ -285,37 +309,107 @@ def _write_svg(
 def _dedupe(
     points: list[tuple[float, float]], tolerance: float = 1e-6
 ) -> list[tuple[float, float]]:
-    """Remove consecutive coincident points from a polyline.
+    """Remove consecutive coincident points from an open polyline.
 
-    A zero-length edge makes the OCC kernel raise ``StdFail_NotDone`` rather
-    than skipping it, so any polyline handed to CadQuery must be free of
-    repeated vertices. Tolerance is in the polyline's own units, millimetres
-    here.
+    A thin wrapper over :func:`rocketopt.cad.mesh.dedupe_polyline`, kept because
+    the CadQuery paths here work in millimetres and want a looser tolerance than
+    the mesh kernel's default.
 
     Parameters
     ----------
     points:
-        Polyline vertices.
+        Polyline vertices in millimetres.
     tolerance:
-        Distance below which two consecutive points are treated as one.
+        Distance below which two consecutive points are treated as one, in
+        millimetres.
 
     Returns
     -------
     list of tuple
         The polyline with consecutive duplicates removed.
     """
-    cleaned: list[tuple[float, float]] = []
-    for point in points:
-        if cleaned and math.hypot(
-            point[0] - cleaned[-1][0], point[1] - cleaned[-1][1]
-        ) < tolerance:
-            continue
-        cleaned.append(point)
-    return cleaned
+    return dedupe_polyline(points, tolerance=tolerance)
 
 
-def export_solids(rocket: Rocket, directory: str | Path) -> list[Path]:
-    """Export STEP and STL solids using CadQuery.
+def export_stl_parts(
+    rocket: Rocket,
+    directory: str | Path,
+    *,
+    tolerances: PrintTolerances = DEFAULT_TOLERANCES,
+    validate: bool = True,
+) -> list[Path]:
+    """Export a printable STL of every part of a design.
+
+    The nose cone comes out with its locating spigot, the motor mount bored to
+    the motor and turned to the airframe, and the fin with its true aerodynamic
+    section - see :mod:`rocketopt.cad.parts` for the interfaces and clearances.
+    Each part is a closed manifold solid in millimetres, oriented with the face
+    that should sit on the print bed at ``z = 0``.
+
+    Parameters
+    ----------
+    rocket:
+        The design.
+    directory:
+        Destination directory, created if needed.
+    tolerances:
+        Print clearances and tessellation settings.
+    validate:
+        Run :func:`rocketopt.cad.validation.validate_printable_assembly` and
+        refuse to write anything unless every check passes. Turn this off only
+        to inspect geometry that is known to be broken.
+
+    Returns
+    -------
+    list of pathlib.Path
+        The STL files written, in assembly order.
+
+    Raises
+    ------
+    rocketopt.cad.validation.AssemblyValidationError
+        If ``validate`` is set and any part would not assemble or would not
+        slice. Nothing is written in that case.
+    """
+    out_dir = Path(directory).expanduser()
+    parts = printable_parts(rocket, tolerances)
+
+    if validate:
+        validation = validate_printable_assembly(rocket, tolerances, parts)
+        if not validation.passed:
+            _log.error("Pre-export checks failed:\n%s", validation.report())
+        validation.raise_for_failures()
+        _log.info(
+            "%s passed all %d pre-export checks",
+            rocket.name,
+            len(validation.checks),
+        )
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written = [
+        write_stl(
+            part.mesh,
+            out_dir / part.filename,
+            name=f"{rocket.name} - {part.name}",
+        )
+        for part in parts
+    ]
+    _log.info("Exported %d printable STL part(s)", len(written))
+    return written
+
+
+def export_solids(
+    rocket: Rocket,
+    directory: str | Path,
+    *,
+    tolerances: PrintTolerances = DEFAULT_TOLERANCES,
+) -> list[Path]:
+    """Export STEP solids using CadQuery.
+
+    The same profiles the STL exporter revolves and lofts are used here, so the
+    STEP bodies carry the nose cone spigot, the airframe-diameter motor mount and
+    the true fin section too. STEP is exact BREP geometry rather than a mesh,
+    which is what a CAM package or a downstream parametric model wants; STLs come
+    from :func:`export_stl_parts` and need no optional dependency.
 
     Parameters
     ----------
@@ -323,6 +417,8 @@ def export_solids(rocket: Rocket, directory: str | Path) -> list[Path]:
         The design.
     directory:
         Destination directory.
+    tolerances:
+        Print clearances and profile sampling, matching the STL parts.
 
     Returns
     -------
@@ -341,71 +437,59 @@ def export_solids(rocket: Rocket, directory: str | Path) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
 
-    # -- Nose cone: revolve the analytic profile ---------------------------
-    xs, ys = rocket.nose.profile_points(120)
-    profile = [(float(x) * 1e3, float(y) * 1e3) for x, y in zip(xs, ys, strict=True)]
-    # Close the profile back along the axis. The profile already begins at the
-    # tip (0, 0), so no extra start point is prepended - doing so creates a
-    # duplicated vertex, and CadQuery raises StdFail_NotDone rather than
-    # silently ignoring the resulting zero-length edge.
-    outline = _dedupe([*profile, (profile[-1][0], 0.0)])
-
-    nose_solid = (
-        cq.Workplane("XZ")
-        .polyline(outline)
-        .close()
-        .revolve(360, (0, 0, 0), (1, 0, 0))
-    )
-    nose_path = out_dir / "nose_cone.step"
-    cq.exporters.export(nose_solid, str(nose_path))
-    written.append(nose_path.resolve())
-
-    # -- Body tube ---------------------------------------------------------
-    body = next(
-        (p.section for p in rocket.sections if isinstance(p.section, BodyTube)), None
-    )
-    if body is not None:
-        tube = (
-            cq.Workplane("XY")
-            .circle(body.outer_radius * 1e3)
-            .circle(body.inner_radius * 1e3)
-            .extrude(body.length * 1e3)
+    def revolved(profile: list[tuple[float, float]], name: str) -> None:
+        """Revolve a ``(z, r)`` profile about Z and write it as STEP."""
+        # On the XZ workplane the local x axis is the global X and the local y
+        # axis is the global Z, so a (radius, height) point becomes (r, 0, z).
+        # The axis of revolution is given in those local coordinates, hence
+        # (0, 1, 0) for the global Z axis - the same orientation the mesh
+        # exporter builds in.
+        solid = (
+            cq.Workplane("XZ")
+            .polyline([(r, z) for z, r in profile])
+            .close()
+            .revolve(360, (0, 0, 0), (0, 1, 0))
         )
-        tube_path = out_dir / "body_tube.step"
-        cq.exporters.export(tube, str(tube_path))
-        written.append(tube_path.resolve())
+        path = out_dir / f"{name}.step"
+        cq.exporters.export(solid, str(path))
+        written.append(path.resolve())
 
-    # -- Fin ----------------------------------------------------------------
-    fins = rocket.fins
-    # A delta fin has zero tip chord, which collapses two corners onto one.
-    fin_outline = _dedupe(
-        [
-            (0.0, 0.0),
-            (fins.sweep_length * 1e3, fins.span * 1e3),
-            ((fins.sweep_length + fins.tip_chord) * 1e3, fins.span * 1e3),
-            (fins.root_chord * 1e3, 0.0),
-        ]
-    )
-    fin_solid = (
-        cq.Workplane("XY")
-        .polyline(fin_outline)
-        .close()
-        .extrude(fins.thickness * 1e3)
-    )
-    for suffix in ("step", "stl"):
-        fin_path = out_dir / f"fin.{suffix}"
-        cq.exporters.export(fin_solid, str(fin_path))
-        written.append(fin_path.resolve())
+    revolved(nose_cone_profile(rocket, tolerances), "nose_cone")
+    revolved(body_tube_profile(rocket), "body_tube")
+    revolved(motor_mount_profile(rocket, tolerances), "motor_mount")
 
-    _log.info("Exported %d CadQuery solid file(s)", len(written))
+    # -- Fin, lofted through its true section ------------------------------
+    sections = fin_loft_sections(
+        rocket, tolerances, min_chord=_MIN_STEP_TIP_CHORD
+    )
+    fin = cq.Workplane("XY")
+    previous = 0.0
+    for height, outline in sections:
+        # Workplane offsets are relative to the current plane, so step by the
+        # gap to the previous section rather than by the absolute height.
+        if height > previous:
+            fin = fin.workplane(offset=height - previous)
+            previous = height
+        fin = fin.polyline(_dedupe(outline)).close()
+    fin_solid = fin.loft(ruled=True)
+    fin_path = out_dir / "fin.step"
+    cq.exporters.export(fin_solid, str(fin_path))
+    written.append(fin_path.resolve())
+
+    _log.info("Exported %d CadQuery STEP solid(s)", len(written))
     return written
 
 
-def export_all(rocket: Rocket, directory: str | Path) -> list[Path]:
+def export_all(
+    rocket: Rocket,
+    directory: str | Path,
+    *,
+    tolerances: PrintTolerances = DEFAULT_TOLERANCES,
+) -> list[Path]:
     """Export every available CAD representation of a design.
 
-    Always writes SVG templates, a DXF fin outline and the Fusion 360 script.
-    Adds STEP and STL solids when CadQuery is installed.
+    Always writes printable STL solids, SVG templates, a DXF fin outline and the
+    Fusion 360 script. Adds STEP solids when CadQuery is installed.
 
     Parameters
     ----------
@@ -413,11 +497,19 @@ def export_all(rocket: Rocket, directory: str | Path) -> list[Path]:
         The design.
     directory:
         Destination directory, created if needed.
+    tolerances:
+        Print clearances and tessellation settings for the STL parts.
 
     Returns
     -------
     list of pathlib.Path
         Every file written.
+
+    Raises
+    ------
+    rocketopt.cad.validation.AssemblyValidationError
+        If the design's parts would not assemble or would not slice. The 2D
+        templates are written first and are unaffected, but no STL is.
     """
     from rocketopt.cad.fusion360 import write_fusion_script
 
@@ -431,12 +523,14 @@ def export_all(rocket: Rocket, directory: str | Path) -> list[Path]:
         write_fusion_script(rocket, out_dir / "fusion360_build.py"),
     ]
 
+    written.extend(export_stl_parts(rocket, out_dir, tolerances=tolerances))
+
     try:
-        written.extend(export_solids(rocket, out_dir))
+        written.extend(export_solids(rocket, out_dir, tolerances=tolerances))
     except ImportError:
         _log.info(
-            "CadQuery is not installed; STEP and STL export skipped. "
-            "Install with: pip install 'rocketopt[cad]'"
+            "CadQuery is not installed; STEP export skipped. The printable STLs "
+            "were still written. Install with: pip install 'rocketopt[cad]'"
         )
 
     return written

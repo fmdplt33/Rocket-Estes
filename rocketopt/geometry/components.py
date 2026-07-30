@@ -13,6 +13,10 @@ Every component exposes a common set of properties so the assembly in
     Barrowman normal-force slope and its application point, where the
     component generates normal force.
 
+Fin cross-sections are defined in :mod:`rocketopt.geometry.fin_sections`, which
+this module re-exports :class:`FinAirfoil` from and defers to for the section
+area used by :attr:`FinSet.volume_single`.
+
 Barrowman fin equations
 -----------------------
 For ``N`` fins of exposed semi-span ``s`` mounted on a body of radius ``r``,
@@ -54,9 +58,11 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from enum import Enum
+from typing import Final
 
 import numpy as np
 
+from rocketopt.geometry.fin_sections import FinAirfoil, section_outline, swept_volume
 from rocketopt.structures.materials import Material
 from rocketopt.utils.constants import (
     CD_PARACHUTE_FLAT_SHEET,
@@ -65,6 +71,8 @@ from rocketopt.utils.constants import (
 )
 
 __all__ = [
+    "MIN_MOTOR_TUBE_WALL",
+    "MOTOR_FIT_CLEARANCE",
     "FinAirfoil",
     "RecoveryType",
     "BodyTube",
@@ -74,32 +82,6 @@ __all__ = [
     "MotorMount",
     "RecoveryDevice",
 ]
-
-
-class FinAirfoil(str, Enum):
-    """Fin cross-section profile.
-
-    The drag multipliers quoted in :meth:`FinSet.profile_drag_factor` are
-    relative to a square-edged flat plate of the same thickness, following
-    Hoerner [4], Ch. 6.
-    """
-
-    SQUARE = "square"
-    """Flat plate, sharp square edges. Simplest to make, highest drag."""
-
-    ROUNDED = "rounded"
-    """Flat plate with leading and trailing edges rounded to a semicircle."""
-
-    AIRFOIL = "airfoil"
-    """Rounded leading edge tapering to a sharp trailing edge."""
-
-    DOUBLE_WEDGE = "double_wedge"
-    """Symmetric diamond section; lowest wave drag at supersonic speed."""
-
-    @property
-    def label(self) -> str:
-        """Human-readable name."""
-        return self.name.replace("_", " ").title()
 
 
 class RecoveryType(str, Enum):
@@ -494,16 +476,53 @@ class FinSet:
     def volume_single(self) -> float:
         """Material volume of one fin [m^3], excluding fillets.
 
-        The airfoil profile removes material relative to a square section; the
-        factors are the section area ratios of each profile.
+        Obtained by integrating the true section area over the span with
+        :func:`~rocketopt.geometry.fin_sections.swept_volume`, so the reported
+        fin mass is the mass of the section that
+        :func:`~rocketopt.cad.parts.fin_mesh` exports - a square section fills
+        its bounding box, a rounded one loses the two edge corners, the NACA
+        aerofoil encloses about 68% of it and the double wedge exactly half.
         """
-        section_factor = {
-            FinAirfoil.SQUARE: 1.00,
-            FinAirfoil.ROUNDED: 0.97,  # two semicircular edges removed
-            FinAirfoil.AIRFOIL: 0.80,  # tapers to a sharp trailing edge
-            FinAirfoil.DOUBLE_WEDGE: 0.50,  # diamond is half a rectangle
-        }[self.airfoil]
-        return self.area_single * self.thickness * section_factor
+        return swept_volume(
+            self.airfoil,
+            root_chord=self.root_chord,
+            tip_chord=self.tip_chord,
+            span=self.span,
+            thickness=self.thickness,
+        )
+
+    def section_outline(
+        self, span_fraction: float = 0.0, *, samples: int = 61
+    ) -> list[tuple[float, float]]:
+        """Return the fin's cross-section outline at a spanwise station.
+
+        Parameters
+        ----------
+        span_fraction:
+            Fraction of the exposed span, 0 at the root and 1 at the tip.
+        samples:
+            Number of chordwise stations in the outline.
+
+        Returns
+        -------
+        list of tuple
+            ``(x, y)`` vertices [m] of the closed section, ``x`` aft of the
+            local leading edge and ``y`` either side of the chord line.
+
+        Raises
+        ------
+        ValueError
+            If ``span_fraction`` is outside ``[0, 1]``.
+        """
+        if not 0.0 <= span_fraction <= 1.0:
+            raise ValueError("span_fraction must lie in [0, 1]")
+        chord = self.root_chord + (self.tip_chord - self.root_chord) * span_fraction
+        return section_outline(
+            self.airfoil,
+            chord=chord,
+            thickness=self.thickness,
+            samples=samples,
+        )
 
     @property
     def mass(self) -> float:
@@ -700,6 +719,18 @@ class LaunchLug:
         return math.pi * self.outer_radius**2
 
 
+MOTOR_FIT_CLEARANCE: Final[float] = 0.8e-3
+"""Diametral clearance between the motor case and the mount bore [m].
+
+0.8 mm on diameter - 0.4 mm radial - is the usual fit for an Estes case in a
+paper motor tube: loose enough to load a motor with cold fingers, tight enough
+that the case cannot rattle sideways under thrust.
+"""
+
+MIN_MOTOR_TUBE_WALL: Final[float] = 0.4e-3
+"""Thinnest motor tube wall a mount is allowed to be sized to [m]."""
+
+
 @dataclass(frozen=True, slots=True)
 class MotorMount:
     """The motor tube, thrust ring and centring rings.
@@ -739,10 +770,91 @@ class MotorMount:
         if self.centring_ring_count < 0:
             raise ValueError("centring ring count must not be negative")
 
+    @classmethod
+    def for_airframe(
+        cls,
+        *,
+        motor_diameter: float,
+        motor_length: float,
+        body_inner_radius: float,
+        material: Material,
+        length: float | None = None,
+        position: float = 0.0,
+        bore_clearance: float = MOTOR_FIT_CLEARANCE,
+    ) -> MotorMount:
+        """Size a self-centring motor mount for an airframe and a motor.
+
+        The mount is a plain tube that fills the airframe bore: its outside
+        diameter *is* the body tube's inside diameter and its bore is the motor
+        case diameter plus a loading clearance. Because it contacts the bore
+        along its whole length it locates the motor concentrically on its own,
+        so no centring rings are fitted, and it is a single part that can be
+        printed and pushed straight into the tube.
+
+        Parameters
+        ----------
+        motor_diameter:
+            Motor case outside diameter [m].
+        motor_length:
+            Motor case length [m], used as the default mount length.
+        body_inner_radius:
+            Inside radius of the body tube the mount sits in [m].
+        material:
+            Mount material.
+        length:
+            Mount length [m]. Defaults to the motor casing length, which
+            supports the case over its full length and lets the aft face carry
+            the thrust ring.
+        position:
+            Axial station of the mount's forward end, aft of the nose tip [m].
+        bore_clearance:
+            Diametral clearance between the case and the bore [m].
+
+        Returns
+        -------
+        MotorMount
+            A mount whose outside diameter equals the airframe bore.
+
+        Raises
+        ------
+        ValueError
+            If the motor plus the thinnest sensible wall will not fit inside
+            the body tube, which means the design needs minimum-diameter
+            construction rather than a mount.
+        """
+        bore = motor_diameter + bore_clearance
+        wall = body_inner_radius - bore / 2.0
+        if wall < MIN_MOTOR_TUBE_WALL:
+            raise ValueError(
+                f"a {motor_diameter * 1e3:.1f} mm motor needs a bore of "
+                f"{bore * 1e3:.1f} mm, which leaves only {wall * 1e3:.2f} mm of "
+                f"wall inside a {body_inner_radius * 2e3:.1f} mm airframe bore; "
+                f"use a larger body tube or minimum-diameter construction"
+            )
+        return cls(
+            inner_diameter=bore,
+            length=motor_length if length is None else length,
+            wall_thickness=wall,
+            material=material,
+            body_inner_radius=body_inner_radius,
+            centring_ring_count=0,
+            position=position,
+        )
+
     @property
     def outer_radius(self) -> float:
         """Motor tube outside radius [m]."""
         return self.inner_diameter / 2.0 + self.wall_thickness
+
+    @property
+    def outer_diameter(self) -> float:
+        """Motor tube outside diameter [m]."""
+        return 2.0 * self.outer_radius
+
+    @property
+    def fits_airframe(self) -> bool:
+        """Whether the mount will go inside the airframe bore it is sized to."""
+        return self.outer_radius <= self.body_inner_radius + 1e-9
 
     @property
     def is_minimum_diameter(self) -> bool:

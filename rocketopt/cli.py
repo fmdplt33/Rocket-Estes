@@ -316,16 +316,17 @@ def _export_everything(outcome: object, directory: Path) -> None:
             "pip install 'rocketopt[reports]'[/yellow]"
         )
 
-    # export_all writes SVG, DXF and the Fusion script unconditionally, and
-    # adds STEP and STL when CadQuery is available.
+    # export_all writes printable STLs, SVG, DXF and the Fusion script
+    # unconditionally, and adds STEP when CadQuery is available.
     from rocketopt.cad.exporters import export_all
 
     written.extend(export_all(rocket, directory))
 
     if not any(p.suffix == ".step" for p in written):
         console.print(
-            "[yellow]CadQuery is not installed, so STEP and STL were skipped. "
-            "Install with: pip install 'rocketopt[cad]'[/yellow]"
+            "[yellow]CadQuery is not installed, so STEP was skipped. The "
+            "printable STLs were still written. Install with: "
+            "pip install 'rocketopt[cad]'[/yellow]"
         )
 
     console.print("\n[green]Written:[/green]")

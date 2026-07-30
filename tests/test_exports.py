@@ -176,12 +176,14 @@ def test_manufacturing_guide_mentions_the_key_dimensions(reference_rocket) -> No
 def test_export_all_writes_the_dependency_free_set(
     reference_rocket, tmp_path: Path
 ) -> None:
-    """SVG, DXF and the Fusion script are always produced."""
+    """SVG, DXF, the Fusion script and every printable STL are always produced."""
     written = export_all(reference_rocket, tmp_path)
     names = {p.name for p in written}
 
     assert {"fin_template.svg", "side_elevation.svg", "fin.dxf",
             "fusion360_build.py"} <= names
+    # STL export needs no optional dependency, so it is never skipped.
+    assert {"nose_cone.stl", "body_tube.stl", "motor_mount.stl", "fin.stl"} <= names
     assert all(p.stat().st_size > 100 for p in written)
 
 
@@ -193,32 +195,46 @@ def test_export_all_writes_the_dependency_free_set(
 @pytest.mark.requires_cad
 @pytest.mark.skipif(not _has_cadquery(), reason="CadQuery is not installed")
 def test_step_export_produces_real_geometry(reference_rocket, tmp_path: Path) -> None:
-    """Exported STEP files are valid and re-import with the right volume.
+    """Exported STEP files are valid and agree with the printable meshes.
 
-    Regression test for a real failure: the nose profile already begins at the
-    tip, so prepending an explicit (0, 0) produced a duplicated vertex and the
-    OCC kernel raised StdFail_NotDone instead of ignoring the zero-length edge.
+    Cross-validation between two independent kernels: the STEP bodies come from
+    OpenCascade and the STLs from the mesh kernel in ``rocketopt.cad.mesh``, but
+    both are built from the same profiles, so their volumes must agree to within
+    the mesh's faceting error.
+
+    Also a regression test for a real failure: the nose profile already begins at
+    the tip, so prepending an explicit (0, 0) produced a duplicated vertex and
+    the OCC kernel raised StdFail_NotDone instead of ignoring the resulting
+    zero-length edge.
     """
     import cadquery as cq
 
     from rocketopt.cad.exporters import export_solids
+    from rocketopt.cad.parts import printable_parts
 
     written = export_solids(reference_rocket, tmp_path)
     names = {p.name for p in written}
-    assert {"nose_cone.step", "body_tube.step", "fin.step", "fin.stl"} <= names
+    assert {
+        "nose_cone.step",
+        "body_tube.step",
+        "motor_mount.step",
+        "fin.step",
+    } <= names
 
     for path in written:
         assert path.stat().st_size > 200
-        if path.suffix == ".step":
-            head = path.read_text(encoding="utf-8", errors="replace")[:300]
-            assert "ISO-10303" in head
+        assert path.suffix == ".step", "STLs come from export_stl_parts"
+        head = path.read_text(encoding="utf-8", errors="replace")[:300]
+        assert "ISO-10303" in head
 
-    # The solid model must agree with the analytic geometry it came from.
-    nose = cq.importers.importStep(str(tmp_path / "nose_cone.step"))
-    volume_mm3 = nose.val().Volume()
-    expected_mm3 = reference_rocket.nose.enclosed_volume * 1e9
-
-    assert volume_mm3 == pytest.approx(expected_mm3, rel=0.02)
+    meshes = {part.key: part.mesh for part in printable_parts(reference_rocket)}
+    for path in written:
+        solid = cq.importers.importStep(str(path))
+        assert solid.val().isValid(), f"{path.name} is not a valid solid"
+        # Faceting makes the mesh very slightly smaller than the exact body.
+        assert solid.val().Volume() == pytest.approx(
+            meshes[path.stem].volume, rel=2e-3
+        ), f"{path.name} disagrees with the mesh it was built alongside"
 
 
 @pytest.mark.requires_cad

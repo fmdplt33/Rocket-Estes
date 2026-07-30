@@ -84,7 +84,10 @@ def build_fusion_script(rocket: Rocket) -> str:
         ("body_length", body.length * 1e3, "Body tube length"),
         ("nose_length", nose.length * 1e3, "Nose cone length"),
         ("nose_wall", nose.wall_thickness * 1e3, "Nose cone wall thickness"),
-        ("nose_shoulder", nose.shoulder_length * 1e3, "Nose shoulder length"),
+        ("nose_shoulder", nose.shoulder_length * 1e3,
+         "Nose cone spigot length, the depth it inserts into the body tube"),
+        ("nose_spigot_diameter", nose.shoulder_outer_radius * 2e3,
+         "Nose cone spigot outside diameter, equal to the body tube bore"),
         ("fin_root_chord", fins.root_chord * 1e3, "Fin root chord"),
         ("fin_tip_chord", fins.tip_chord * 1e3, "Fin tip chord"),
         ("fin_span", fins.span * 1e3, "Fin exposed semi-span"),
@@ -93,8 +96,11 @@ def build_fusion_script(rocket: Rocket) -> str:
         ("fin_fillet", max(fins.fillet_radius * 1e3, 0.0), "Fin root fillet radius"),
         ("fin_station", (fins.position - nose.length) * 1e3,
          "Fin root leading edge, aft of the body tube's forward end"),
-        ("motor_tube_id", rocket.motor_mount.inner_diameter * 1e3, "Motor tube bore"),
-        ("motor_tube_length", rocket.motor_mount.length * 1e3, "Motor tube length"),
+        ("motor_tube_id", rocket.motor_mount.inner_diameter * 1e3,
+         "Motor mount bore, the motor case diameter plus a loading clearance"),
+        ("motor_tube_od", rocket.motor_mount.outer_diameter * 1e3,
+         "Motor mount outside diameter, equal to the body tube bore"),
+        ("motor_tube_length", rocket.motor_mount.length * 1e3, "Motor mount length"),
     ]
     parameter_literal = ",\n        ".join(
         f'("{name}", {value:.4f}, "{description}")'
@@ -282,6 +288,50 @@ def run(context):
                      'blunt the tip if a hollow cone is required.')
 
         # ---------------------------------------------------------------
+        # Nose cone spigot: locates the cone in the body tube, so its
+        # outside diameter is the tube's bore
+        # ---------------------------------------------------------------
+        _log('Building nose cone spigot')
+        spigot_sketch = sketches.add(root.xZConstructionPlane)
+        spigot_lines = spigot_sketch.sketchCurves.sketchLines
+        s_x0 = P('nose_length') * MM
+        s_x1 = s_x0 + P('nose_shoulder') * MM
+        s_out = 0.5 * P('nose_spigot_diameter') * MM
+        s_in = max(s_out - P('nose_wall') * MM, 0.0)
+
+        s_corners = [
+            adsk.core.Point3D.create(s_x0, s_in, 0),
+            adsk.core.Point3D.create(s_x0, s_out, 0),
+            adsk.core.Point3D.create(s_x1, s_out, 0),
+            adsk.core.Point3D.create(s_x1, s_in, 0),
+        ]
+        for i in range(len(s_corners)):
+            spigot_lines.addByTwoPoints(
+                s_corners[i], s_corners[(i + 1) % len(s_corners)])
+
+        spigot_axis = spigot_lines.addByTwoPoints(
+            adsk.core.Point3D.create(s_x0, 0, 0),
+            adsk.core.Point3D.create(s_x1, 0, 0))
+        spigot_axis.isConstruction = True
+
+        spigot_rev = revolves.createInput(
+            spigot_sketch.profiles.item(0), spigot_axis,
+            adsk.fusion.FeatureOperations.JoinFeatureOperation)
+        spigot_rev.setAngleExtent(
+            False, adsk.core.ValueInput.createByReal(2 * math.pi))
+        try:
+            revolves.add(spigot_rev)
+        except Exception:
+            # Joining needs the spigot to touch the shelled cone. If the shell
+            # failed above, or the wall leaves no overlap, build it separately
+            # and say so rather than aborting.
+            spigot_rev.operation = (
+                adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
+            revolves.add(spigot_rev).bodies.item(0).name = 'Nose cone spigot'
+            _log('Spigot built as a separate body - combine it with the nose '
+                 'cone before exporting a single printable part.')
+
+        # ---------------------------------------------------------------
         # Body tube
         # ---------------------------------------------------------------
         _log('Building body tube')
@@ -321,7 +371,7 @@ def run(context):
         m_x1 = x1
         m_x0 = m_x1 - P('motor_tube_length') * MM
         m_in = 0.5 * P('motor_tube_id') * MM
-        m_out = m_in + P('body_wall') * MM
+        m_out = 0.5 * P('motor_tube_od') * MM
 
         m_corners = [
             adsk.core.Point3D.create(m_x0, m_in, 0),

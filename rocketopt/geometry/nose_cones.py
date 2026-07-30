@@ -73,11 +73,51 @@ from numpy.typing import NDArray
 from rocketopt.structures.materials import Material, get_material
 
 __all__ = [
+    "MAX_SHOULDER_LENGTH",
+    "MIN_SHOULDER_LENGTH",
     "NoseConeShape",
     "NoseCone",
     "SHAPE_PARAMETER_RANGES",
     "default_shape_parameter",
+    "default_shoulder_length",
 ]
+
+MIN_SHOULDER_LENGTH: Final[float] = 0.020
+"""Shortest shoulder a nose cone is given by default [m].
+
+Below about 20 mm the ejection charge works the joint in peel rather than in
+shear and the shoulder starts to split away, whatever it is made of.
+"""
+
+MAX_SHOULDER_LENGTH: Final[float] = 0.040
+"""Longest shoulder a nose cone is given by default [m].
+
+Beyond 40 mm the shoulder is only taking up recovery bay; the joint is already
+far stronger than the loads it sees.
+"""
+
+
+def default_shoulder_length(base_diameter: float, tube_length: float) -> float:
+    """Return a sensible shoulder length for a cone on a given tube.
+
+    One body diameter is the usual rule of thumb, clamped into
+    ``[MIN_SHOULDER_LENGTH, MAX_SHOULDER_LENGTH]`` and to a quarter of the tube
+    length so that a short airframe keeps a usable recovery bay.
+
+    Parameters
+    ----------
+    base_diameter:
+        Nose cone base diameter, which is the body tube's outside diameter [m].
+    tube_length:
+        Length of the body tube the shoulder plugs into [m].
+
+    Returns
+    -------
+    float
+        Shoulder length [m].
+    """
+    clamped = min(max(base_diameter, MIN_SHOULDER_LENGTH), MAX_SHOULDER_LENGTH)
+    return min(clamped, 0.25 * tube_length)
 
 _PROFILE_SAMPLES: Final[int] = 400
 """Stations used for numerical volume and wetted-area integration.
@@ -210,6 +250,14 @@ class NoseCone:
     shoulder_length:
         Length of the shoulder that plugs into the body tube [m]. Contributes
         mass but no external wetted area.
+    shoulder_radius:
+        Outside radius of that shoulder [m], which is the body tube's *inside*
+        radius when the cone is to locate in the tube. Left at ``None`` it
+        falls back to ``base_radius - wall_thickness``, the shoulder a moulded
+        cone of this wall thickness naturally has.
+        :func:`~rocketopt.geometry.rocket.build_rocket` sets it from the body
+        tube it assembles the cone onto, so the mass model and the exported
+        spigot are the same part.
     """
 
     shape: NoseConeShape
@@ -220,6 +268,7 @@ class NoseCone:
     shape_parameter: float = 1.0
     solid: bool = False
     shoulder_length: float = 0.0
+    shoulder_radius: float | None = None
 
     def __post_init__(self) -> None:
         """Validate the geometry."""
@@ -229,6 +278,13 @@ class NoseCone:
             raise ValueError("nose cone base radius must be positive")
         if self.shoulder_length < 0.0:
             raise ValueError("shoulder length must not be negative")
+        if self.shoulder_radius is not None and not (
+            0.0 < self.shoulder_radius <= self.base_radius
+        ):
+            raise ValueError(
+                f"shoulder radius {self.shoulder_radius} m must be positive and "
+                f"no larger than the base radius {self.base_radius} m"
+            )
         if not self.solid:
             if self.wall_thickness <= 0.0:
                 raise ValueError("hollow nose cone needs a positive wall thickness")
@@ -312,7 +368,14 @@ class NoseCone:
             case _:  # pragma: no cover - Enum is exhaustive
                 raise ValueError(f"unhandled nose cone shape {self.shape}")
 
-        return np.maximum(y, 0.0)
+        # Every family is pointed at the tip, so the radius there is exactly
+        # zero. The ogive forms reach it by subtracting two nearly equal large
+        # numbers - ``sqrt(rho^2 - L^2) + R - rho`` - and leave a residue of a
+        # few times 1e-14 m behind. That is meaningless as a radius but not as a
+        # topology: revolved, a residual radius makes a ring of slivers at the
+        # apex instead of a single point, so it is snapped away here where the
+        # profile is defined rather than in each consumer.
+        return np.where(xs <= 0.0, 0.0, np.maximum(y, 0.0))
 
     def _haack(self, f: NDArray[np.float64], *, C: float) -> NDArray[np.float64]:
         """Evaluate the Haack series profile.
@@ -351,6 +414,24 @@ class NoseCone:
     def base_diameter(self) -> float:
         """Diameter at the base [m]."""
         return 2.0 * self.base_radius
+
+    @property
+    def shoulder_outer_radius(self) -> float:
+        """Resolved outside radius of the shoulder [m].
+
+        :attr:`shoulder_radius` when it was given, otherwise
+        ``base_radius - wall_thickness``.
+        """
+        if self.shoulder_radius is not None:
+            return self.shoulder_radius
+        return max(self.base_radius - self.wall_thickness, 0.0)
+
+    @property
+    def shoulder_inner_radius(self) -> float:
+        """Bore radius of the shoulder [m], zero when it is solid."""
+        if self.solid:
+            return 0.0
+        return max(self.shoulder_outer_radius - self.wall_thickness, 0.0)
 
     @property
     def fineness_ratio(self) -> float:
@@ -396,7 +477,8 @@ class NoseCone:
         A solid cone uses the full enclosed volume. A hollow cone uses a shell
         of :attr:`wall_thickness`, computed as the difference between the outer
         profile and an inner profile offset inward by the wall thickness. The
-        shoulder is modelled as a tube of the same wall thickness.
+        shoulder is a tube of the same wall thickness, or solid stock on a
+        turned cone.
         """
         if self.solid:
             shell = self.enclosed_volume
@@ -406,11 +488,16 @@ class NoseCone:
             shell = float(np.trapezoid(math.pi * (y * y - inner * inner), x))
 
         if self.shoulder_length > 0.0:
-            r_out = self.base_radius - self.wall_thickness
-            r_in = max(r_out - self.wall_thickness, 0.0)
-            shell += math.pi * (r_out**2 - r_in**2) * self.shoulder_length
+            shell += self._shoulder_volume
 
         return shell
+
+    @property
+    def _shoulder_volume(self) -> float:
+        """Volume of material in the shoulder alone [m^3]."""
+        r_out = self.shoulder_outer_radius
+        r_in = self.shoulder_inner_radius
+        return math.pi * (r_out**2 - r_in**2) * self.shoulder_length
 
     @property
     def mass(self) -> float:
@@ -441,9 +528,7 @@ class NoseCone:
             return cg_cone
 
         # Combine the cone with its shoulder, whose centroid sits aft of the base.
-        r_out = self.base_radius - self.wall_thickness
-        r_in = max(r_out - self.wall_thickness, 0.0)
-        v_shoulder = math.pi * (r_out**2 - r_in**2) * self.shoulder_length
+        v_shoulder = self._shoulder_volume
         cg_shoulder = self.length + self.shoulder_length / 2.0
         total = volume + v_shoulder
         return (cg_cone * volume + cg_shoulder * v_shoulder) / total

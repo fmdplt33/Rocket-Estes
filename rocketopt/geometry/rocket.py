@@ -44,7 +44,7 @@ from rocketopt.geometry.mass_properties import (
     transition_properties,
     tube_properties,
 )
-from rocketopt.geometry.nose_cones import NoseCone
+from rocketopt.geometry.nose_cones import NoseCone, default_shoulder_length
 from rocketopt.structures.materials import SurfaceFinish
 from rocketopt.utils.logging import get_logger
 
@@ -150,6 +150,28 @@ class Rocket:
                     f"x={expected:.6f} m but found one at x={placed.position:.6f} m"
                 )
             expected = placed.aft_position
+
+        # The nose cone shoulder must go into the tube it sits on.
+        first = self.sections[0].section
+        bore = (
+            first.inner_radius
+            if isinstance(first, BodyTube)
+            else first.fore_radius - first.wall_thickness
+        )
+        if self.nose.shoulder_outer_radius > bore + 1e-6:
+            raise ValueError(
+                f"the nose cone shoulder is "
+                f"{self.nose.shoulder_outer_radius * 2e3:.2f} mm diameter but the "
+                f"section behind it bores only {bore * 2e3:.2f} mm"
+            )
+
+        # The mount must fit the airframe it is bridged to.
+        if not self.motor_mount.fits_airframe:
+            raise ValueError(
+                f"the motor mount is {self.motor_mount.outer_diameter * 1e3:.2f} mm "
+                f"outside diameter but the airframe bores only "
+                f"{self.motor_mount.body_inner_radius * 2e3:.2f} mm"
+            )
 
         # The motor must physically fit the mount, and the mount the airframe.
         if self.motor.motor.diameter > self.motor_mount.inner_diameter + 1e-6:
@@ -458,6 +480,41 @@ class Rocket:
         )
 
 
+def _fit_nose_to_tube(nose: NoseCone, body_tube: BodyTube) -> NoseCone:
+    """Return the nose cone with its shoulder resolved against a body tube.
+
+    A nose cone is specified without reference to the tube it will sit on, so
+    the shoulder that locates it in that tube is resolved here, once, and stored
+    on the cone. The mass model and the exported spigot then describe the same
+    part: :func:`rocketopt.cad.parts.nose_cone_mesh` builds the spigot from
+    :attr:`~rocketopt.geometry.nose_cones.NoseCone.shoulder_outer_radius`.
+
+    Parameters
+    ----------
+    nose:
+        The cone as specified.
+    body_tube:
+        The tube immediately aft of it.
+
+    Returns
+    -------
+    NoseCone
+        The cone with an explicit shoulder radius equal to the tube's bore, and
+        a default shoulder length if none was given.
+    """
+    shoulder = nose.shoulder_length
+    if shoulder <= 0.0:
+        shoulder = default_shoulder_length(body_tube.diameter, body_tube.length)
+    if (
+        nose.shoulder_radius == body_tube.inner_radius
+        and shoulder == nose.shoulder_length
+    ):
+        return nose
+    return replace(
+        nose, shoulder_length=shoulder, shoulder_radius=body_tube.inner_radius
+    )
+
+
 def build_rocket(
     *,
     nose: NoseCone,
@@ -481,10 +538,18 @@ def build_rocket(
     places the fin root so the fins end flush with the aft end of the body
     unless told otherwise.
 
+    It also resolves the two interfaces a component cannot resolve on its own,
+    because neither the nose cone nor the motor mount knows the tube it will be
+    fitted to: the nose cone's shoulder is set to the body tube's bore, and an
+    automatically generated motor mount is sized so that its outside diameter
+    *is* that bore. Both are then the parts
+    :mod:`rocketopt.cad.parts` exports.
+
     Parameters
     ----------
     nose:
-        Nose cone.
+        Nose cone. Its shoulder radius, and its shoulder length if it has none,
+        are resolved against ``body_tube``.
     body_tube:
         Main body tube.
     fins:
@@ -494,8 +559,10 @@ def build_rocket(
     recovery:
         Recovery device.
     motor_mount:
-        Motor mount. When ``None``, one is sized automatically to the motor
-        with a snug fit and two centring rings.
+        Motor mount. When ``None``, one is sized automatically by
+        :meth:`~rocketopt.geometry.components.MotorMount.for_airframe`: bored to
+        the motor with a loading clearance and turned to the body tube's bore,
+        so it centres itself and needs no rings.
     boat_tail:
         Optional aft transition.
     launch_lug:
@@ -530,19 +597,16 @@ def build_rocket(
 
     body_aft = placed[0].aft_position
 
+    nose = _fit_nose_to_tube(nose, body_tube)
+
     if motor_mount is None:
         motor_obj = motor.motor
-        # A snug motor tube: 0.4 mm radial clearance is the usual fit for a
-        # paper motor tube on an Estes case.
-        mount_length = motor_obj.length
-        motor_mount = MotorMount(
-            inner_diameter=motor_obj.diameter + 0.8e-3,
-            length=mount_length,
-            wall_thickness=body_tube.wall_thickness,
-            material=body_tube.material,
+        motor_mount = MotorMount.for_airframe(
+            motor_diameter=motor_obj.diameter,
+            motor_length=motor_obj.length,
             body_inner_radius=body_tube.inner_radius,
-            centring_ring_count=2,
-            position=body_aft - mount_length,
+            material=body_tube.material,
+            position=body_aft - motor_obj.length,
         )
     if motor_mount.position + motor_mount.length > body_aft + 1e-9:
         raise ValueError(

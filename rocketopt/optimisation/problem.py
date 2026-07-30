@@ -53,6 +53,7 @@ from rocketopt.geometry.nose_cones import (
     SHAPE_PARAMETER_RANGES,
     NoseCone,
     NoseConeShape,
+    default_shoulder_length,
 )
 from rocketopt.geometry.rocket import Rocket, build_rocket
 from rocketopt.propulsion.motor import MotorConfiguration
@@ -775,7 +776,9 @@ def decode(space: DesignSpace, vector: Sequence[float]) -> Rocket:
         wall_thickness=min(1.5e-3, body_radius * 0.3),
         shape_parameter=shape_parameter,
         solid=solid,
-        shoulder_length=min(0.025, body_length * 0.15),
+        # The shoulder locates the cone in the tube and is what gets exported as
+        # the spigot, so it follows the same rule build_rocket would apply.
+        shoulder_length=default_shoulder_length(2.0 * body_radius, body_length),
     )
 
     # -- Fins --------------------------------------------------------------
@@ -808,13 +811,15 @@ def decode(space: DesignSpace, vector: Sequence[float]) -> Rocket:
             f"motor {motor.designation} is longer than the {body_length * 1e3:.0f} mm "
             f"body tube"
         )
-    motor_mount = MotorMount(
-        inner_diameter=motor_obj.diameter + 0.8e-3,
-        length=mount_length,
-        wall_thickness=wall_thickness,
-        material=wall_material,
+    # Turned to the airframe bore so it centres itself: see
+    # MotorMount.for_airframe. Raises when the motor will not fit the tube at
+    # all, which decode()'s caller treats as an infeasible candidate.
+    motor_mount = MotorMount.for_airframe(
+        motor_diameter=motor_obj.diameter,
+        motor_length=motor_obj.length,
         body_inner_radius=body_tube.inner_radius,
-        centring_ring_count=2,
+        material=wall_material,
+        length=mount_length,
         position=nose_length + body_length - mount_length,
     )
 
