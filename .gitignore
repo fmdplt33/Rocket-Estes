@@ -1,0 +1,25 @@
+# Byte-compiled Python
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build artefacts. rocketopt.egg-info is tracked, so it is not ignored here.
+build/
+dist/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
