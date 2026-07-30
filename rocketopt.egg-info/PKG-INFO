@@ -1,0 +1,48 @@
+Metadata-Version: 2.4
+Name: rocketopt
+Version: 1.0.0
+Summary: Automated design, analysis, optimisation and CAD export of high-performance model rockets for Estes motors.
+Author: RocketOpt Contributors
+License: MIT
+Project-URL: Documentation, https://github.com/rocketopt/rocketopt/tree/main/docs
+Project-URL: Source, https://github.com/rocketopt/rocketopt
+Keywords: model-rocketry,aerodynamics,barrowman,optimisation,cad,flight-simulation
+Classifier: Development Status :: 5 - Production/Stable
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Classifier: Topic :: Scientific/Engineering :: Physics
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=2.0
+Requires-Dist: scipy>=1.11
+Requires-Dist: pydantic>=2.6
+Requires-Dist: PyYAML>=6.0
+Requires-Dist: pandas>=2.1
+Requires-Dist: matplotlib>=3.8
+Requires-Dist: plotly>=5.18
+Requires-Dist: deap>=1.4
+Requires-Dist: sympy>=1.12
+Requires-Dist: networkx>=3.2
+Requires-Dist: rich>=13.7
+Requires-Dist: typer>=0.12
+Provides-Extra: ui
+Requires-Dist: PySide6>=6.6; extra == "ui"
+Requires-Dist: pyvista>=0.43; extra == "ui"
+Requires-Dist: pyvistaqt>=0.11; extra == "ui"
+Provides-Extra: cad
+Requires-Dist: cadquery>=2.4; extra == "cad"
+Requires-Dist: ezdxf>=1.1; extra == "cad"
+Provides-Extra: mdo
+Requires-Dist: openmdao>=3.30; extra == "mdo"
+Provides-Extra: reports
+Requires-Dist: reportlab>=4.0; extra == "reports"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.1; extra == "dev"
+Requires-Dist: mypy>=1.8; extra == "dev"
+Requires-Dist: ruff>=0.3; extra == "dev"
+Provides-Extra: all
+Requires-Dist: rocketopt[cad,mdo,reports,ui]; extra == "all"
