@@ -14,6 +14,7 @@ for further manual work rather than a dead end.
 
 from __future__ import annotations
 
+import contextlib
 import math
 import traceback
 from dataclasses import replace
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDockWidget,
     QFileDialog,
+    QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -63,6 +65,8 @@ from rocketopt.ui.animation import AnimationPage
 from rocketopt.ui.panels import DesignPanel, DesignValues, ResultsPanel
 from rocketopt.ui.plots import ConvergencePlot, DragPlot, ParetoPlot, TrajectoryPlot
 from rocketopt.ui.rocket_view import RocketView
+from rocketopt.ui.viewer3d import Viewer3DPage
+from rocketopt.ui.windtunnel import WindTunnelPage
 from rocketopt.utils.constants import (
     MIN_LIFTOFF_THRUST_TO_WEIGHT,
     MIN_RAIL_EXIT_VELOCITY,
@@ -377,9 +381,23 @@ class MainWindow(QMainWindow):
         self.rocket_view = RocketView()
         self.rocket_view.finsEdited.connect(self._on_fins_dragged)
         rocket_layout.addWidget(self.rocket_view)
+
+        plan_controls = QHBoxLayout()
+        plan_controls.setSpacing(8)
+        self.plan_fit_button = QPushButton("Fit")
+        self.plan_fit_button.setToolTip(
+            "Frame the whole rocket again. Double-clicking the view does the "
+            "same."
+        )
+        self.plan_fit_button.clicked.connect(self.rocket_view.fit)
+        plan_controls.addWidget(self.plan_fit_button)
+        plan_controls.addStretch(1)
+        rocket_layout.addLayout(plan_controls)
+
         hint = QLabel(
             "Drag the circled points on the fin to reshape it - the numbers on "
-            "the left follow, and vice versa. The centre of pressure (CP) must "
+            "the left follow, and vice versa. Scroll to zoom about the pointer "
+            "and drag anywhere else to pan. The centre of pressure (CP) must "
             "sit aft of the centre of gravity (CG); the gap between them, in "
             "body diameters, is the static margin. Aim for 1.0 to 2.0."
         )
@@ -387,6 +405,12 @@ class MainWindow(QMainWindow):
         hint.setProperty("muted", True)
         rocket_layout.addWidget(hint)
         self.tabs.addTab(rocket_tab, "Rocket")
+
+        self.viewer_page = Viewer3DPage()
+        self.tabs.addTab(self.viewer_page, "3D")
+
+        self.wind_tunnel = WindTunnelPage()
+        self.tabs.addTab(self.wind_tunnel, "Wind tunnel")
 
         self.animation_page = AnimationPage()
         self.tabs.addTab(self.animation_page, "Animation")
@@ -409,12 +433,22 @@ class MainWindow(QMainWindow):
         """Build the menu bar."""
         file_menu = self.menuBar().addMenu("&File")
 
+        export_bundle = QAction("Export &everything to one file...", self)
+        export_bundle.setShortcut(QKeySequence("Ctrl+Shift+E"))
+        export_bundle.setStatusTip(
+            "Write every STL, STEP, template and report into a single zip"
+        )
+        export_bundle.triggered.connect(self._export_bundle)
+        file_menu.addAction(export_bundle)
+
+        file_menu.addSeparator()
+
         export_report = QAction("Export &report...", self)
         export_report.setShortcut(QKeySequence("Ctrl+R"))
         export_report.triggered.connect(self._export_report)
         file_menu.addAction(export_report)
 
-        export_cad = QAction("Export &CAD...", self)
+        export_cad = QAction("Export CAD to a &folder...", self)
         export_cad.setShortcut(QKeySequence("Ctrl+E"))
         export_cad.triggered.connect(self._export_cad)
         file_menu.addAction(export_cad)
@@ -436,6 +470,8 @@ class MainWindow(QMainWindow):
         except (ValueError, KeyError) as exc:
             self._rocket = None
             self.rocket_view.set_rocket(None, 0.0, 0.0)
+            self.viewer_page.set_rocket(None)
+            self.wind_tunnel.set_rocket(None)
             self.results_panel.set_error(str(exc))
             self.statusBar().showMessage(f"Invalid design: {exc}")
             return
@@ -507,7 +543,12 @@ class MainWindow(QMainWindow):
         # were three quarters of the interactive latency. Only the visible tab
         # is redrawn; the others are marked stale and refreshed when opened.
         self._drag_plot_data = (breakdown, speeds, totals)
-        self._stale_tabs = {self.trajectory_plot, self.drag_plot}
+        self._stale_tabs = {
+            self.trajectory_plot,
+            self.drag_plot,
+            self.viewer_page,
+            self.wind_tunnel,
+        }
         self._animation_stale = True
         self._refresh_visible_tab()
 
@@ -544,6 +585,12 @@ class MainWindow(QMainWindow):
             elif current is self.drag_plot and self._drag_plot_data is not None:
                 breakdown, speeds, totals = self._drag_plot_data
                 self.drag_plot.show_drag(breakdown, speeds, totals)
+            elif current is self.viewer_page:
+                self.viewer_page.set_rocket(self._rocket)
+            elif current is self.wind_tunnel:
+                # Solving the field costs a good fraction of a second, so it
+                # only happens for a tab somebody is actually looking at.
+                self.wind_tunnel.set_rocket(self._rocket)
             self._stale_tabs.discard(current)
 
     def _refresh_animation(self) -> None:
@@ -800,6 +847,57 @@ class MainWindow(QMainWindow):
             return
 
         self.statusBar().showMessage(f"Report written to {path}")
+
+    def _export_bundle(self) -> None:
+        """Write every output for the current design into a single archive."""
+        if self._rocket is None:
+            QMessageBox.information(
+                self,
+                "Nothing to export",
+                "Adjust the design to produce a result first.",
+            )
+            return
+
+        default = f"{self._rocket.name.replace(' ', '_')}.zip"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export everything", default, "Zip archive (*.zip)"
+        )
+        if not path:
+            return
+
+        # Re-fly at full fidelity: the on-screen numbers come from the coarse
+        # preview, and an exported report should not.
+        flight: FlightResult | None = self._flight
+        with contextlib.suppress(ValueError):
+            flight = simulate(
+                self._rocket,
+                conditions_from_values(self.design_panel.values()),
+                SimulationConfig(six_dof=True),
+            )
+
+        self.statusBar().showMessage("Exporting...")
+        try:
+            from rocketopt.bundle import write_bundle
+
+            contents = write_bundle(self._rocket, path, flight=flight)
+        except Exception as exc:  # every failure here is reported to the user
+            QMessageBox.warning(self, "Export failed", str(exc))
+            self.statusBar().showMessage("Export failed")
+            return
+
+        size_kb = contents.path.stat().st_size / 1024
+        QMessageBox.information(
+            self,
+            "Export complete",
+            f"{contents.file_count} files written to\n{contents.path}\n"
+            f"({size_kb:.0f} kB)\n\n"
+            "print/ holds the STLs, ready to slice.\n"
+            "cad/ holds STEP solids, templates and the Fusion 360 script.\n"
+            "reports/ holds the engineering report and build guide.",
+        )
+        self.statusBar().showMessage(
+            f"{contents.file_count} files bundled into {contents.path}"
+        )
 
     def _export_cad(self) -> None:
         """Write CAD output for the current design."""

@@ -26,6 +26,14 @@ Editing is two-way: the handles move when the numeric fields change, and the
 numeric fields update as the handles are dragged. Neither is the master copy -
 they are two views of the same values.
 
+Navigation
+----------
+The view fits the whole rocket by default. The wheel zooms about the pointer, so
+whatever is under it stays under it, and dragging anywhere but on a handle pans.
+Zoomed in far enough to see a fin fillet or the wall of a tube, the handles keep
+working, so a fin can be shaped at whatever scale suits. Double-clicking, or the
+Fit button beside the view, returns to the whole rocket.
+
 The static margin is the most important number on the screen, so the gap
 between the CG and CP markers is annotated directly with its value in calibres
 and colour-coded against the stability band.
@@ -34,6 +42,7 @@ and colour-coded against the stability band.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
@@ -46,6 +55,7 @@ from PySide6.QtGui import (
     QPainter,
     QPainterPath,
     QPen,
+    QWheelEvent,
 )
 from PySide6.QtWidgets import QSizePolicy, QToolTip, QWidget
 
@@ -76,6 +86,14 @@ _HANDLE_RADIUS = 6.0
 
 _GRAB_RADIUS = 13.0
 """Pointer distance within which a handle is grabbed, in pixels."""
+
+_MIN_ZOOM = 0.4
+_MAX_ZOOM = 60.0
+"""Zoom limits relative to the fitted scale. The upper end resolves a 0.1 mm
+wall on a 25 mm tube; the lower end keeps the rocket from vanishing."""
+
+_ZOOM_PER_NOTCH = 1.2
+"""Zoom factor for one wheel detent."""
 
 # Fin dimension limits, matching the spin-box ranges in the design panel so
 # that dragging can never produce a value the numeric fields would reject.
@@ -147,6 +165,9 @@ class RocketView(QWidget):
         self._dragging: FinHandle | None = None
         self._hovered: FinHandle | None = None
         self._editable: bool = True
+        self._zoom: float = 1.0
+        self._pan = QPointF(0.0, 0.0)
+        self._panning_from: QPointF | None = None
 
         self.setMinimumHeight(260)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -177,6 +198,91 @@ class RocketView(QWidget):
             self._dragging = None
             self._hovered = None
         self.update()
+
+    # -- View navigation -----------------------------------------------------
+
+    def fit(self) -> None:
+        """Return to the fitted view of the whole rocket."""
+        self._zoom = 1.0
+        self._pan = QPointF(0.0, 0.0)
+        self.update()
+
+    @property
+    def zoom(self) -> float:
+        """Current magnification relative to the fitted scale [-]."""
+        return self._zoom
+
+    def _base_transform(self) -> _Transform | None:
+        """Return the fitted, unzoomed and unpanned model-to-screen mapping.
+
+        Shared by painting and by the wheel handler, which has to know where a
+        point would land before and after a zoom to keep it under the pointer.
+        """
+        rocket = self._rocket
+        if rocket is None:
+            return None
+
+        usable_width = self.width() - 2 * _MARGIN_PX
+        usable_height = self.height() - 2 * _MARGIN_PX
+        if usable_width <= 20 or usable_height <= 20:
+            return None
+
+        half_height = max(
+            rocket.reference_radius,
+            rocket.fins.span + rocket.fins.body_radius,
+        )
+        scale = min(
+            usable_width / rocket.length,
+            usable_height / (2.0 * half_height),
+        )
+        return _Transform(
+            scale=scale, origin_x=float(_MARGIN_PX), axis_y=self.height() / 2.0
+        )
+
+    def _current_transform(self) -> _Transform | None:
+        """Return the mapping in force, zoom and pan included."""
+        base = self._base_transform()
+        if base is None:
+            return None
+        return _Transform(
+            scale=base.scale * self._zoom,
+            origin_x=base.origin_x + self._pan.x(),
+            axis_y=base.axis_y + self._pan.y(),
+        )
+
+    def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802 - Qt override
+        """Zoom about the pointer."""
+        base = self._base_transform()
+        if base is None:
+            return
+        notches = event.angleDelta().y() / 120.0
+        if not notches:
+            return
+
+        zoom = min(max(self._zoom * _ZOOM_PER_NOTCH**notches, _MIN_ZOOM), _MAX_ZOOM)
+        if zoom == self._zoom:
+            return
+
+        # Hold the model point under the pointer still: solve the pan that maps
+        # it back to the same screen position at the new scale.
+        current = self._current_transform()
+        assert current is not None
+        pointer = event.position()
+        model_x = current.to_model_x(pointer.x())
+        model_r = current.to_model_r(pointer.y())
+
+        self._zoom = zoom
+        scale = base.scale * zoom
+        self._pan = QPointF(
+            pointer.x() - base.origin_x - model_x * scale,
+            pointer.y() - base.axis_y + model_r * scale,
+        )
+        self.update()
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
+        """Return to the fitted view."""
+        del event
+        self.fit()
 
     # -- Handle geometry ----------------------------------------------------
 
@@ -217,21 +323,45 @@ class RocketView(QWidget):
     # -- Mouse interaction ---------------------------------------------------
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
-        """Begin a drag if a handle was grabbed."""
-        if not self._editable or self._rocket is None:
-            return
-        if event.button() is not Qt.MouseButton.LeftButton:
+        """Grab a handle, or begin a pan.
+
+        The left button edits a fin when it lands on a handle and pans
+        otherwise, so the same button does the obvious thing in both places.
+        """
+        if self._rocket is None:
             return
 
-        handle = self._handle_at(event.position())
+        handle = (
+            self._handle_at(event.position())
+            if self._editable and event.button() is Qt.MouseButton.LeftButton
+            else None
+        )
         if handle is not None:
             self._dragging = handle
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             self.update()
+            return
+
+        if event.button() in (
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.MiddleButton,
+            Qt.MouseButton.RightButton,
+        ):
+            self._panning_from = event.position()
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
-        """Update the fin while dragging, or highlight a hovered handle."""
-        if self._rocket is None or not self._editable:
+        """Pan, update the fin being dragged, or highlight a hovered handle."""
+        if self._rocket is None:
+            return
+
+        if self._panning_from is not None:
+            self._pan += event.position() - self._panning_from
+            self._panning_from = event.position()
+            self.update()
+            return
+
+        if not self._editable:
             return
 
         if self._dragging is None:
@@ -253,8 +383,12 @@ class RocketView(QWidget):
         self._apply_drag(event.position())
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
-        """End a drag."""
+        """End a drag or a pan."""
         del event
+        if self._panning_from is not None:
+            self._panning_from = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            return
         if self._dragging is not None:
             self._dragging = None
             self.setCursor(
@@ -333,24 +467,14 @@ class RocketView(QWidget):
             painter.end()
             return
 
-        usable_width = self.width() - 2 * _MARGIN_PX
-        usable_height = self.height() - 2 * _MARGIN_PX
-        if usable_width <= 20 or usable_height <= 20:
+        transform = self._current_transform()
+        if transform is None:
             painter.end()
             return
 
-        half_height = max(
-            rocket.reference_radius,
-            rocket.fins.span + rocket.fins.body_radius,
-        )
-        scale = min(
-            usable_width / rocket.length,
-            usable_height / (2.0 * half_height),
-        )
-        self._transform = _Transform(
-            scale=scale, origin_x=float(_MARGIN_PX), axis_y=self.height() / 2.0
-        )
-        t = self._transform
+        self._transform = transform
+        t = transform
+        scale = t.scale
 
         def sx(x: float) -> float:
             """Model axial station to screen x."""
@@ -390,7 +514,13 @@ class RocketView(QWidget):
         painter.setPen(QPen(QColor(BORDER), 1, Qt.PenStyle.DashLine))
         painter.drawLine(QPointF(x0 - 20, axis_y), QPointF(x1 + 20, axis_y))
 
-    def _draw_body(self, painter: QPainter, rocket: Rocket, sx, sy) -> None:
+    def _draw_body(
+        self,
+        painter: QPainter,
+        rocket: Rocket,
+        sx: Callable[[float], float],
+        sy: Callable[[float], float],
+    ) -> None:
         """Draw the nose and body outline as a filled silhouette."""
         path = QPainterPath()
 
@@ -425,7 +555,13 @@ class RocketView(QWidget):
         painter.setPen(QPen(QColor(TEXT_MUTED), 1.4))
         painter.drawPath(path)
 
-    def _draw_fins(self, painter: QPainter, rocket: Rocket, sx, sy) -> None:
+    def _draw_fins(
+        self,
+        painter: QPainter,
+        rocket: Rocket,
+        sx: Callable[[float], float],
+        sy: Callable[[float], float],
+    ) -> None:
         """Draw the fin planform above and below the body."""
         fins = rocket.fins
         root_x = fins.position
@@ -450,7 +586,13 @@ class RocketView(QWidget):
             path.closeSubpath()
             painter.drawPath(path)
 
-    def _draw_motor(self, painter: QPainter, rocket: Rocket, sx, sy) -> None:
+    def _draw_motor(
+        self,
+        painter: QPainter,
+        rocket: Rocket,
+        sx: Callable[[float], float],
+        sy: Callable[[float], float],
+    ) -> None:
         """Outline the installed motor inside the airframe."""
         motor = rocket.motor.motor
         x0 = rocket.motor_position
@@ -496,7 +638,11 @@ class RocketView(QWidget):
             painter.drawEllipse(rect)
 
     def _draw_markers(
-        self, painter: QPainter, rocket: Rocket, sx, axis_y: float
+        self,
+        painter: QPainter,
+        rocket: Rocket,
+        sx: Callable[[float], float],
+        axis_y: float,
     ) -> None:
         """Draw the CG and CP markers and annotate the static margin."""
         calibre = rocket.reference_diameter
@@ -568,8 +714,14 @@ class RocketView(QWidget):
     def _draw_scale_bar(
         self, painter: QPainter, rocket: Rocket, scale: float, origin_x: float
     ) -> None:
-        """Draw a labelled scale bar so dimensions can be read off directly."""
-        target = rocket.length / 4.0
+        """Draw a labelled scale bar so dimensions can be read off directly.
+
+        The bar is sized from what is on screen rather than from the rocket, so
+        it stays a useful length at any zoom: a quarter of the visible width,
+        rounded to one significant figure.
+        """
+        del rocket
+        target = (self.width() / scale) / 4.0
         exponent = math.floor(math.log10(target)) if target > 0 else -2
         step = 10.0**exponent
         bar_m = round(target / step) * step
@@ -577,8 +729,9 @@ class RocketView(QWidget):
             return
 
         y = self.height() - 24.0
-        x0 = origin_x
-        x1 = origin_x + bar_m * scale
+        x0 = float(_MARGIN_PX)
+        x1 = x0 + bar_m * scale
+        del origin_x
 
         painter.setPen(QPen(QColor(TEXT_MUTED), 1.4))
         painter.drawLine(QPointF(x0, y), QPointF(x1, y))
@@ -591,12 +744,15 @@ class RocketView(QWidget):
         painter.drawText(
             QRectF(x0, y + 4, x1 - x0, 16),
             Qt.AlignmentFlag.AlignCenter,
-            f"{bar_m * 1e3:.0f} mm",
+            f"{bar_m * 1e3:.3g} mm",
         )
 
         painter.setPen(QPen(QColor(TEXT_MUTED)))
+        note = "Drag the circles on the fin to reshape it"
+        if abs(self._zoom - 1.0) > 1e-3:
+            note = f"{self._zoom:.1f}x  -  double-click to fit"
         painter.drawText(
-            QRectF(x1 + 14, y - 4, 320, 16),
+            QRectF(x1 + 14, y - 4, 360, 16),
             Qt.AlignmentFlag.AlignLeft,
-            "Drag the circles on the fin to reshape it",
+            note,
         )

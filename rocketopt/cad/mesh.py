@@ -291,6 +291,45 @@ class TriangleMesh:
         shift = np.asarray(offset, dtype=np.float64)
         return TriangleMesh(self.vertices + shift, self.faces)
 
+    def transformed(
+        self,
+        rotation: NDArray[np.float64],
+        translation: Sequence[float] | NDArray[np.float64] = (0.0, 0.0, 0.0),
+    ) -> TriangleMesh:
+        """Return a copy rotated and then translated.
+
+        Parameters
+        ----------
+        rotation:
+            ``(3, 3)`` matrix applied to every vertex. Its columns are the
+            images of the local axes.
+        translation:
+            Three-component offset applied after the rotation.
+
+        Returns
+        -------
+        TriangleMesh
+            The transformed mesh. A rotation that reflects - one with a negative
+            determinant - turns the solid inside out, so the winding is reversed
+            to compensate and the normals keep pointing outward.
+
+        Raises
+        ------
+        ValueError
+            If the matrix is not ``(3, 3)`` or is singular.
+        """
+        matrix = np.asarray(rotation, dtype=np.float64)
+        if matrix.shape != (3, 3):
+            raise ValueError("rotation must be a (3, 3) matrix")
+
+        determinant = float(np.linalg.det(matrix))
+        if abs(determinant) < 1e-12:
+            raise ValueError("rotation matrix is singular")
+
+        moved = self.vertices @ matrix.T + np.asarray(translation, dtype=np.float64)
+        faces = self.faces[:, ::-1].copy() if determinant < 0.0 else self.faces
+        return TriangleMesh(moved, faces)
+
     def scaled(self, factor: float) -> TriangleMesh:
         """Return a copy scaled about the origin.
 

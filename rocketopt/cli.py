@@ -5,6 +5,7 @@ Run ``rocketopt --help`` for the full command list. The common workflows are::
     rocketopt motors                        # list the motor database
     rocketopt design C6-5                   # optimise a rocket for a motor
     rocketopt design C6-5 --for altitude --export out/
+    rocketopt design C6-5 --bundle alpha.zip   # everything in one file
     rocketopt simulate design.yaml          # fly a saved design
     rocketopt ui                            # open the desktop interface
 """
@@ -125,6 +126,14 @@ def design_command(
         Path | None,
         typer.Option("--export", "-e", help="Directory to write reports and CAD to."),
     ] = None,
+    bundle: Annotated[
+        Path | None,
+        typer.Option(
+            "--bundle",
+            "-b",
+            help="Write everything into a single .zip instead of loose files.",
+        ),
+    ] = None,
     seed: Annotated[
         int, typer.Option("--seed", help="Random seed for a reproducible run.")
     ] = 20260729,
@@ -193,6 +202,31 @@ def design_command(
 
     if export is not None:
         _export_everything(outcome, export)
+
+    if bundle is not None:
+        _export_bundle(outcome, bundle)
+
+
+def _export_bundle(outcome: object, path: Path) -> None:
+    """Write every output for an outcome into a single archive."""
+    from rocketopt.bundle import write_bundle
+
+    rocket = outcome.best  # type: ignore[attr-defined]
+    flight = outcome.flight  # type: ignore[attr-defined]
+
+    with console.status("Bundling...", spinner="dots"):
+        contents = write_bundle(rocket, path, flight=flight)
+
+    console.print(
+        f"\n[green]Bundled {contents.file_count} files "
+        f"({contents.path.stat().st_size / 1024:.0f} kB) into:[/green]\n"
+        f"  {contents.path}"
+    )
+    console.print(
+        "[dim]  print/    STL solids, ready to slice\n"
+        "  cad/      STEP solids, templates and the Fusion 360 script\n"
+        "  reports/  engineering report and build guide[/dim]"
+    )
 
 
 def _print_outcome(outcome: object) -> None:

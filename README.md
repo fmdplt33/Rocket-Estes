@@ -33,6 +33,12 @@ rocketopt motors
 rocketopt design C6-5 --for altitude --export out/
 ```
 
+Or as a single file, ready to send on:
+
+```bash
+rocketopt design C6-5 --bundle alpha.zip
+```
+
 ---
 
 ## What it does
@@ -48,7 +54,7 @@ rocketopt design C6-5 --for altitude --export out/
 | `cfd` | Axisymmetric potential flow and boundary-layer separation |
 | `cad` | Printable STL solids, SVG templates, DXF, STEP, parametric Fusion 360 script |
 | `reports` | Engineering report, manufacturing guide, bill of materials |
-| `ui` | Desktop application with live analysis and flight animation |
+| `ui` | Desktop application: live analysis, 3D viewer, wind tunnel, flight animation |
 
 ---
 
@@ -57,8 +63,21 @@ rocketopt design C6-5 --for altitude --export out/
 Edit on the left, see the consequence immediately in the centre and right.
 There is no "calculate" button — every change re-analyses in about 60 ms.
 
+- **3D** — a shaded model of the assembled rocket, built from the same solids
+  that get exported. Orbit with the left button, pan with the right, zoom with
+  the wheel. *X-ray* makes the airframe translucent to show the motor mount and
+  motor in place; *Cutaway* sections the half nearest the camera along the body
+  axis, so wall thicknesses and internal fits can be read directly. Rendered by
+  a small software rasteriser, so it needs no GPU and no extra dependency.
+- **Wind tunnel** — the flow field around the airframe at a chosen test speed:
+  pressure coefficient through the axis with traced streamlines, the surface
+  pressure distribution with the stagnation point and suction peak marked, and
+  boundary-layer growth with transition and any separation. The model is the
+  inviscid axisymmetric one from `cfd`, so it speaks to the body, not the fins.
 - **Rocket** — a to-scale side elevation. Drag the circled points on the fin to
-  reshape it; the numeric fields follow, and vice versa.
+  reshape it; the numeric fields follow, and vice versa. Scroll to zoom about
+  the pointer and drag anywhere else to pan — the handles keep working at any
+  magnification, so a fillet or a wall can be set at the scale it deserves.
 - **Animation** — the flight replayed, with a speed-against-time curve that
   draws itself out in step with the rocket. Events (rail exit, max
   acceleration, max Q, top speed, booster cutoff, apogee, ejection, landing)
@@ -135,7 +154,7 @@ model; the published figure looks optimistic. It has not been tuned to match.
 python -m pytest tests/ -q
 ```
 
-158 tests, including regression tests for seven real bugs found during
+190 tests, including regression tests for seven real bugs found during
 development: a secant-ogive construction that produced `X_cp/L = -51428`; a
 discontinuity at the laminar–turbulent transition that would have put a false
 cliff in the optimiser's objective; a potential-flow tip singularity that
@@ -186,6 +205,20 @@ raises `AssemblyValidationError` listing every problem and writes nothing:
 from rocketopt.cad import validate_printable_assembly
 
 print(validate_printable_assembly(rocket).report())
+```
+
+### Everything in one file
+
+`--bundle` puts the whole design into a single `.zip` instead of loose files —
+`print/` for the STLs, `cad/` for STEP, templates and the Fusion script,
+`reports/` for the engineering report and build guide, and a `README.txt` at the
+root stating the mating diameters and print clearances. The same is on the
+desktop app's File menu as *Export everything to one file* (Ctrl+Shift+E).
+
+```python
+from rocketopt.bundle import write_bundle
+
+write_bundle(rocket, "alpha.zip")
 ```
 
 The self-centring motor mount fills the annulus between the motor and the
